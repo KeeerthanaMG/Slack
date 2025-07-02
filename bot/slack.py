@@ -17,7 +17,8 @@ from django.utils import timezone
 
 from .models import (
     SlackWorkspace, SlackChannel, ChannelSummary, 
-    ConversationContext, BotCommand, ChatbotInteraction
+    ConversationContext, BotCommand, ChatbotInteraction,
+    VIPUser, VIPSummaryHistory
 )
 from .summarizer import (
     ChannelSummarizer, filter_messages_by_timeframe, extract_channel_name_from_command, 
@@ -25,6 +26,7 @@ from .summarizer import (
     is_thread_command
 )
 from .intent_classifier import IntentClassifier, ChatbotResponder
+from .vip_manager import VIPManager
 
 logger = logging.getLogger(__name__)
 
@@ -36,15 +38,24 @@ class SlackBotHandler:
     
     def __init__(self):
         """Initialize the Slack bot with API credentials"""
-        if not settings.SLACK_BOT_TOKEN:
-            raise ValueError("SLACK_BOT_TOKEN not found in settings")
+        self.slack_token = settings.SLACK_BOT_TOKEN
         
-        self.client = WebClient(token=settings.SLACK_BOT_TOKEN)
+        if not self.slack_token:
+            logger.error("SLACK_BOT_TOKEN not found in settings. Please configure your .env file.")
+            # Create a dummy client for testing, but warn about missing credentials
+            self.client = None
+            self.vip_manager = None
+        else:
+            self.client = WebClient(token=self.slack_token)
+            self.vip_manager = VIPManager(self.client)
+            
         self.summarizer = ChannelSummarizer()
         self.intent_classifier = IntentClassifier()
         self.responder = ChatbotResponder()
         self.bot_user_id = None
-        self._initialize_bot_info()
+        
+        if self.client:
+            self._initialize_bot_info()
     
     def _initialize_bot_info(self):
         """Initialize bot information like user ID"""
@@ -70,6 +81,14 @@ class SlackBotHandler:
         user_id = payload.get('user_id')
         channel_id = payload.get('channel_id')
         
+        # Check if Slack client is properly configured
+        if not self.client:
+            logger.error(f"Slack client not configured for command: {command}")
+            return {
+                "response_type": "ephemeral",
+                "text": "❌ Bot configuration error: Slack credentials not found. Please contact administrator."
+            }
+        
         # Log the command
         bot_command = BotCommand.objects.create(
             command=command,
@@ -82,6 +101,8 @@ class SlackBotHandler:
         try:
             if command == '/summary':
                 return self._handle_summary_command(payload, bot_command)
+            elif command == '/vip':
+                return self._handle_vip_command(payload, bot_command)
             else:
                 return self._handle_unknown_command(command)
                 
@@ -98,7 +119,7 @@ class SlackBotHandler:
     
     def _handle_summary_command(self, payload: Dict, bot_command: BotCommand) -> Dict:
         """
-        Handle the /summary command and its variations including unread and thread
+        Handle the /summary command and its variations including unread, thread, and VIP summaries
         
         Args:
             payload: Slack command payload
@@ -117,8 +138,12 @@ class SlackBotHandler:
         # Process the summary request asynchronously
         try:
             if text:
+                # Check if it's a VIP summary command
+                if self._is_vip_summary_command(text):
+                    return self._handle_vip_summary_command(text, channel_id, user_id, bot_command)
+                
                 # Check if it's a thread command first
-                if is_thread_command(f"/summary {text}"):
+                elif is_thread_command(f"/summary {text}"):
                     thread_type, target, message_ts = extract_thread_command_details(f"/summary {text}")
                     
                     if thread_type == 'latest':
@@ -162,7 +187,7 @@ class SlackBotHandler:
                         
                         self._send_error_message(
                             channel_id, 
-                            "❌ Please specify a valid command. Examples:\n• `/summary general` - Regular summary\n• `/summary unread general` - Unread messages summary\n• `/summary thread latest general` - Latest thread summary\n• `/summary thread <message-link>` - Specific thread summary"
+                            "❌ Please specify a valid command. Examples:\n• `/summary general` - Regular summary\n• `/summary unread general` - Unread messages summary\n• `/summary thread latest general` - Latest thread summary\n• `/summary thread <message-link>` - Specific thread summary\n• `/summary vip john` - VIP DM summary\n• `/summary john general` - VIP channel summary"
                         )
             else:
                 # Summarize current channel (regular)
@@ -186,6 +211,10 @@ class SlackBotHandler:
     def _send_acknowledgment_message(self, channel_id: str, user_id: str):
         """Send acknowledgment message to user"""
         try:
+            if not self.client:
+                logger.error("Cannot send acknowledgment: Slack client not configured")
+                return
+                
             self.client.chat_postMessage(
                 channel=channel_id,
                 text=f"<@{user_id}> Your summary is getting generated ⏳",
@@ -1760,6 +1789,329 @@ class SlackBotHandler:
             )
 
 # Utility function for command handlers
+    # VIP Management Methods
+    
+    def _handle_vip_command(self, payload: Dict, bot_command: BotCommand) -> Dict:
+        """
+        Handle /vip commands for VIP user management
+        
+        Args:
+            payload: Slack command payload
+            bot_command: Database record for this command
+            
+        Returns:
+            Response dictionary for Slack
+        """
+        text = payload.get('text', '').strip()
+        user_id = payload.get('user_id')
+        channel_id = payload.get('channel_id')
+        
+        if not text:
+            return self._show_vip_help()
+        
+        # Check if VIP manager is available
+        if not self.vip_manager:
+            bot_command.status = 'failed'
+            bot_command.error_message = 'VIP manager not available - missing credentials'
+            bot_command.save()
+            
+            return {
+                "response_type": "ephemeral",
+                "text": "❌ VIP management not available: Slack credentials not configured. Please contact administrator."
+            }
+        
+        parts = text.split()
+        action = parts[0].lower()
+        
+        try:
+            if action == 'add' and len(parts) >= 2:
+                # Extract user ID from mention
+                target_user = self._extract_user_id_from_mention(parts[1])
+                if not target_user:
+                    return {"response_type": "ephemeral", "text": "❌ Please mention a valid user. Example: `/vip add @username`"}
+                
+                success, message = self.vip_manager.add_vip_user(target_user, user_id)
+                bot_command.status = 'completed' if success else 'failed'
+                bot_command.save()
+                
+                return {"response_type": "ephemeral", "text": message}
+                
+            elif action == 'remove' and len(parts) >= 2:
+                target_user = self._extract_user_id_from_mention(parts[1])
+                if not target_user:
+                    return {"response_type": "ephemeral", "text": "❌ Please mention a valid user. Example: `/vip remove @username`"}
+                
+                success, message = self.vip_manager.remove_vip_user(target_user, user_id)
+                bot_command.status = 'completed' if success else 'failed'
+                bot_command.save()
+                
+                return {"response_type": "ephemeral", "text": message}
+                
+            elif action == 'list':
+                vip_list = self._generate_vip_list(user_id)
+                bot_command.status = 'completed'
+                bot_command.save()
+                
+                return {"response_type": "ephemeral", "text": vip_list}
+                
+            else:
+                return self._show_vip_help()
+                
+        except Exception as e:
+            logger.error(f"Error in VIP command: {str(e)}")
+            bot_command.status = 'failed'
+            bot_command.error_message = str(e)
+            bot_command.save()
+            
+            return {"response_type": "ephemeral", "text": "❌ An error occurred while processing VIP command."}
+    
+    def _is_vip_summary_command(self, text: str) -> bool:
+        """Check if the command is a VIP summary command"""
+        parts = text.split()
+        
+        # Check for /summary vip username pattern
+        if len(parts) >= 2 and parts[0].lower() == 'vip':
+            return True
+        
+        # Check for /summary username channel pattern (VIP channel summary)
+        if len(parts) == 2:
+            username = parts[0].lstrip('@')
+            channel_name = parts[1].lstrip('#')
+            # Note: We'll validate VIP status in the actual handler since we need user_id context
+            return True
+        
+        return False
+    
+    def _handle_vip_summary_command(self, text: str, channel_id: str, user_id: str, bot_command: BotCommand) -> Dict:
+        """Handle VIP summary commands"""
+        parts = text.split()
+        
+        try:
+            # /summary vip username (DM summary)
+            if len(parts) >= 2 and parts[0].lower() == 'vip':
+                vip_username = parts[1].lstrip('@')
+                vip_user = self.vip_manager.get_vip_by_username(vip_username, user_id)
+                
+                if not vip_user:
+                    bot_command.status = 'failed'
+                    bot_command.error_message = f'VIP user not found: {vip_username}'
+                    bot_command.save()
+                    
+                    self._send_error_message(
+                        channel_id,
+                        f"❌ {vip_username} is not in your VIP list. Use `/vip list` to see your VIP users or `/vip add @{vip_username}` to add them."
+                    )
+                    return {"response_type": "ephemeral", "text": ""}
+                
+                # Process VIP DM summary
+                self._process_vip_dm_summary(vip_user, channel_id, user_id, bot_command)
+                
+            # /summary username channel (VIP channel summary)
+            elif len(parts) == 2:
+                vip_username = parts[0].lstrip('@')
+                target_channel = parts[1].lstrip('#')
+                
+                vip_user = self.vip_manager.get_vip_by_username(vip_username, user_id)
+                if not vip_user:
+                    bot_command.status = 'failed'
+                    bot_command.error_message = f'VIP user not found: {vip_username}'
+                    bot_command.save()
+                    
+                    self._send_error_message(
+                        channel_id,
+                        f"❌ {vip_username} is not in your VIP list. Use `/vip list` to see your VIP users or `/vip add @{vip_username}` to add them."
+                    )
+                    return {"response_type": "ephemeral", "text": ""}
+                
+                # Process VIP channel summary
+                self._process_vip_channel_summary(vip_user, target_channel, channel_id, user_id, bot_command)
+            
+            return {"response_type": "ephemeral", "text": ""}
+            
+        except Exception as e:
+            logger.error(f"Error in VIP summary command: {str(e)}")
+            bot_command.status = 'failed'
+            bot_command.error_message = str(e)
+            bot_command.save()
+            
+            self._send_error_message(
+                channel_id,
+                "❌ Failed to generate VIP summary. Please try again later."
+            )
+            
+            return {"response_type": "ephemeral", "text": ""}
+    
+    def _process_vip_dm_summary(self, vip_user: VIPUser, response_channel_id: str, user_id: str, bot_command: BotCommand):
+        """Process VIP DM summary request"""
+        try:
+            # Get VIP DM messages
+            dm_messages = self.vip_manager.get_vip_dm_messages(vip_user.user_id)
+            
+            # Generate summary
+            summary = self.vip_manager.summarize_vip_dms(vip_user, dm_messages, user_id)
+            
+            # Send summary message
+            self._send_vip_summary_message(response_channel_id, summary, user_id, "DM")
+            
+            bot_command.status = 'completed'
+            bot_command.execution_time = time.time() - float(bot_command.created_at.timestamp())
+            bot_command.save()
+            
+        except Exception as e:
+            logger.error(f"Error processing VIP DM summary for {vip_user.username}: {str(e)}")
+            bot_command.status = 'failed'
+            bot_command.error_message = str(e)
+            bot_command.save()
+            
+            self._send_error_message(
+                response_channel_id,
+                f"❌ Failed to generate VIP DM summary for @{vip_user.username}. Please try again later."
+            )
+    
+    def _process_vip_channel_summary(self, vip_user: VIPUser, channel_name: str, response_channel_id: str, user_id: str, bot_command: BotCommand):
+        """Process VIP channel summary request"""
+        try:
+            # Get target channel info
+            channel_info = self._get_channel_info(channel_name)
+            if not channel_info:
+                bot_command.status = 'failed'
+                bot_command.error_message = f'Channel not found: {channel_name}'
+                bot_command.save()
+                
+                self._send_error_message(
+                    response_channel_id,
+                    f"❌ Channel #{channel_name} not found or bot doesn't have access to it."
+                )
+                return
+            
+            target_channel_id = channel_info['id']
+            
+            # Get VIP channel messages
+            vip_messages = self.vip_manager.get_vip_channel_messages(vip_user.user_id, target_channel_id)
+            
+            # Generate summary
+            summary = self.vip_manager.summarize_vip_channel_activity(
+                vip_user, target_channel_id, channel_name, vip_messages, user_id
+            )
+            
+            # Send summary message
+            self._send_vip_summary_message(response_channel_id, summary, user_id, "Channel")
+            
+            bot_command.status = 'completed'
+            bot_command.execution_time = time.time() - float(bot_command.created_at.timestamp())
+            bot_command.save()
+            
+        except Exception as e:
+            logger.error(f"Error processing VIP channel summary for {vip_user.username} in {channel_name}: {str(e)}")
+            bot_command.status = 'failed'
+            bot_command.error_message = str(e)
+            bot_command.save()
+            
+            self._send_error_message(
+                response_channel_id,
+                f"❌ Failed to generate VIP channel summary for @{vip_user.username} in #{channel_name}. Please try again later."
+            )
+    
+    def _send_vip_summary_message(self, channel_id: str, summary: str, user_id: str, summary_type: str):
+        """Send VIP summary message to channel"""
+        try:
+            if not self.client:
+                logger.error("Cannot send VIP summary: Slack client not configured")
+                return
+            
+            # Prepare the message text
+            message_text = f"<@{user_id}> Here's your VIP {summary_type} summary:\n\n{summary}"
+            
+            # Check if message is too long (Slack limit is ~40,000 chars, but we'll be conservative)
+            if len(message_text) > 35000:
+                logger.warning(f"VIP summary message too long ({len(message_text)} chars), truncating...")
+                # Truncate the summary but keep the structure
+                truncated_summary = summary[:30000] + "\n\n... (truncated due to length limits)"
+                message_text = f"<@{user_id}> Here's your VIP {summary_type} summary:\n\n{truncated_summary}"
+            
+            response = self.client.chat_postMessage(
+                channel=channel_id,
+                text=message_text,
+                unfurl_links=False,
+                unfurl_media=False
+            )
+            
+            if not response.get('ok'):
+                logger.error(f"Failed to send VIP summary - Slack API error: {response.get('error', 'unknown')}")
+            else:
+                logger.info(f"Successfully sent VIP {summary_type} summary to {channel_id}")
+                
+        except SlackApiError as e:
+            logger.error(f"SlackApiError sending VIP summary message: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error sending VIP summary message: {e}")
+    
+    def _extract_user_id_from_mention(self, mention: str) -> Optional[str]:
+        """Extract user ID from Slack mention format"""
+        # Handle <@U123456> format
+        if mention.startswith('<@') and mention.endswith('>'):
+            return mention[2:-1]
+        
+        # Handle @username format - try to find user by username
+        username = mention.lstrip('@')
+        try:
+            # Search for user by display name or username
+            response = self.client.users_list()
+            if response.get('ok'):
+                for user in response.get('members', []):
+                    if (user.get('name') == username or 
+                        user.get('real_name', '').lower() == username.lower() or
+                        user.get('display_name', '').lower() == username.lower()):
+                        return user.get('id')
+        except SlackApiError as e:
+            logger.error(f"Error searching for user {username}: {e}")
+        
+        return None
+    
+    def _generate_vip_list(self, user_id: str) -> str:
+        """Generate formatted list of VIP users for a specific user"""
+        vip_users = self.vip_manager.get_all_vips(user_id)
+        
+        if not vip_users:
+            return "📋 **Your VIP User List**\n\nYou haven't added any VIP users yet.\n\n💡 **Get started:** Use `/vip add @username` to add someone to your VIP tracking list."
+        
+        vip_list = ["📋 **Your VIP User List**\n"]
+        
+        for vip in vip_users:
+            added_date = vip.added_at.strftime('%Y-%m-%d')
+            vip_list.append(f"• <@{vip.user_id}> ({vip.display_name}) - Added on {added_date}")
+        
+        vip_list.append(f"\n**Total VIP Users:** {len(vip_users)}")
+        vip_list.append(f"\n💡 **Usage:** `/summary vip username` for DM summary, `/summary username channel` for channel activity")
+        
+        return "\n".join(vip_list)
+    
+    def _show_vip_help(self) -> Dict:
+        """Show VIP command help"""
+        help_text = """🔹 **VIP User Management & Summary Commands**
+
+**🎯 Important Note:** Since Slack's native VIP data isn't accessible via API, use these commands to designate your important contacts for specialized tracking.
+
+**Manage Your VIP List:**
+• `/vip add @username` - Add user to your VIP tracking list
+• `/vip remove @username` - Remove user from VIP list  
+• `/vip list` - Display all your tracked VIP users
+
+**VIP Summary Commands:**
+• `/summary vip username` - Get VIP's DM conversation summary
+• `/summary username channel` - Get VIP's activity in specific channel
+
+**Quick Examples:**
+• `/vip add @sarah` - Start tracking Sarah as VIP
+• `/summary vip sarah` - Get Sarah's DM summary  
+• `/summary sarah general` - Get Sarah's activity in #general
+• `/summary sarah marketing` - Get Sarah's activity in #marketing
+
+**💡 Tip:** Add your key team members, clients, or stakeholders as VIPs to easily track their communications and contributions across channels and DMs."""
+        
+        return {"response_type": "ephemeral", "text": help_text}
+
+
 def verify_slack_signature(request_body: str, timestamp: str, signature: str) -> bool:
     """
     Verify that the request is from Slack using the signing secret

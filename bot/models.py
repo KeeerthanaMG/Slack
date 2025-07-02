@@ -144,3 +144,46 @@ class UserReadStatus(models.Model):
     
     def __str__(self):
         return f"{self.user_id} in {self.channel_id}"
+
+
+class VIPUser(models.Model):
+    """Model to track VIP users with special summarization capabilities"""
+    user_id = models.CharField(max_length=50)  # VIP's Slack user ID
+    username = models.CharField(max_length=100)  # VIP's @username
+    display_name = models.CharField(max_length=100)  # VIP's real name
+    added_by = models.CharField(max_length=50)  # Who assigned VIP status (owner of VIP list)
+    added_at = models.DateTimeField(auto_now_add=True)
+    is_active = models.BooleanField(default=True)
+    
+    class Meta:
+        ordering = ['-added_at']
+        unique_together = ('user_id', 'added_by')  # Each user can have their own VIP list
+    
+    def __str__(self):
+        return f"VIP: {self.username} (added by {self.added_by})"
+
+
+class VIPSummaryHistory(models.Model):
+    """Model to track VIP summarization history"""
+    vip_user = models.ForeignKey(VIPUser, on_delete=models.CASCADE)
+    summary_type = models.CharField(max_length=20, choices=[
+        ('dm', 'Direct Message'),
+        ('channel', 'Channel Activity'),
+    ])
+    channel_id = models.CharField(max_length=50, blank=True)  # For channel summaries
+    channel_name = models.CharField(max_length=200, blank=True)  # For display purposes
+    last_summarized_at = models.DateTimeField()
+    summary_content = models.TextField()
+    requested_by = models.CharField(max_length=50)  # Who requested the summary
+    messages_count = models.IntegerField(default=0)
+    timeframe_hours = models.IntegerField(default=24)
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        ordering = ['-created_at']
+    
+    def __str__(self):
+        if self.summary_type == 'dm':
+            return f"VIP DM Summary: {self.vip_user.username} at {self.created_at}"
+        else:
+            return f"VIP Channel Summary: {self.vip_user.username} in #{self.channel_name} at {self.created_at}"

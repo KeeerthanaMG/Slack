@@ -1635,6 +1635,15 @@ class SlackBotHandler:
             #         text=checklist_template
             #     )
             
+            priority_order = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3}
+            deduplicated_tasks.sort(
+            key=lambda t: priority_order.get(
+                    (getattr(t, 'priority', None) or t.get('priority', 'medium')).lower(), 2
+                )
+            )
+            # --- END PRIORITY SORTING LOGIC ---
+
+            # Now build and send the checklist as before
             if deduplicated_tasks:
                 blocks = self._build_blockkit_checklist(deduplicated_tasks[:50])  # Slack limit
                 self.client.chat_postMessage(
@@ -1643,7 +1652,6 @@ class SlackBotHandler:
                     text="Your personal master todo list"
                 )
             else:
-                # fallback to text template if no tasks
                 checklist_template = self._generate_personal_canvas_content(user_id, deduplicated_tasks)
                 self.client.chat_postMessage(
                     channel=dm_channel_id,

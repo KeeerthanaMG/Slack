@@ -4,6 +4,7 @@ Handles all Slack API interactions, event processing, and command handling
 """
 import json
 import logging
+import threading
 import time
 import hmac
 import hashlib
@@ -1434,32 +1435,89 @@ class SlackBotHandler:
                 "text": "❌ An error occurred while processing your tasks command. Please try again later."
             }
 
+    # def _handle_task_command(self, payload: Dict, bot_command: BotCommand) -> Dict:
+    #     """
+    #     Handle the /task command with two modes:
+    #     1. In channel: processes channel messages → updates channel canvas
+    #     2. In personal DM: scans ALL channels + DMs → creates personal master Canvas
+        
+    #     Args:
+    #         payload: Slack slash command payload
+    #         bot_command: BotCommand database record
+            
+    #     Returns:
+    #         Response dictionary for Slack
+    #     """
+    #     text = payload.get('text', '').strip()
+    #     user_id = payload.get('user_id')
+    #     channel_id = payload.get('channel_id')
+        
+    #     # Check if this is a DM with the bot (personal mode)
+    #     is_personal_dm = self._is_personal_dm(channel_id, user_id)
+        
+    #     if is_personal_dm:
+    #         # Personal productivity mode - scan entire workspace
+    #         return self._handle_personal_task_command(payload, bot_command)
+    #     else:
+    #         # Channel mode - process channel messages to channel canvas
+    #         return self._handle_channel_task_command(payload, bot_command, text)
     def _handle_task_command(self, payload: Dict, bot_command: BotCommand) -> Dict:
         """
         Handle the /task command with two modes:
         1. In channel: processes channel messages → updates channel canvas
         2. In personal DM: scans ALL channels + DMs → creates personal master Canvas
-        
-        Args:
-            payload: Slack slash command payload
-            bot_command: BotCommand database record
-            
-        Returns:
-            Response dictionary for Slack
         """
         text = payload.get('text', '').strip()
         user_id = payload.get('user_id')
         channel_id = payload.get('channel_id')
-        
-        # Check if this is a DM with the bot (personal mode)
+
         is_personal_dm = self._is_personal_dm(channel_id, user_id)
-        
+
         if is_personal_dm:
-            # Personal productivity mode - scan entire workspace
-            return self._handle_personal_task_command(payload, bot_command)
+            # Immediate response to avoid timeout
+            threading.Thread(
+                target=self._handle_personal_task_command,
+                args=(payload, bot_command),
+                daemon=True
+            ).start()
+            return {
+                "response_type": "ephemeral",
+                "text": "🤖 Personal Task Analysis is starting in the background. You’ll get your results here soon!"
+            }
         else:
-            # Channel mode - process channel messages to channel canvas
             return self._handle_channel_task_command(payload, bot_command, text)
+    
+    def _build_blockkit_checklist(self, tasks: List[Dict]) -> List[Dict]:
+        """
+        Build a Block Kit checklist for Slack DMs (not persistent).
+        """
+        blocks = [
+            {
+                "type": "header",
+                "text": {"type": "plain_text", "text": "🎯 Personal Master Todo List"}
+            }
+        ]
+        for task in tasks:
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*{task.get('title', 'Untitled task')}*"
+                },
+                "accessory": {
+                    "type": "checkboxes",
+                    "options": [
+                        {
+                            "text": {
+                                "type": "plain_text",
+                                "text": "Mark complete"
+                            },
+                            "value": f"task_{task.get('message_timestamp', '')}"
+                        }
+                    ]
+                }
+            })
+        return blocks
 
     def _is_personal_dm(self, channel_id: str, user_id: str) -> bool:
         """
@@ -1552,11 +1610,6 @@ class SlackBotHandler:
             all_tasks = all_channel_tasks + all_dm_tasks
             deduplicated_tasks = self._deduplicate_tasks(all_tasks)
             
-            # Create personal Canvas in the DM
-            canvas_success, canvas_message = self._create_personal_canvas(
-                dm_channel_id, user_id, deduplicated_tasks
-            )
-            
             # Create todos in database (using special personal channel)
             todos_created = self._save_personal_todos(user_id, deduplicated_tasks)
             
@@ -1569,23 +1622,45 @@ class SlackBotHandler:
             result_message += f"• {len(deduplicated_tasks)} unique tasks after deduplication\n"
             result_message += f"• {todos_created} todos created in your personal system\n\n"
             
-            if canvas_success:
-                result_message += f"🎨 **Personal Canvas Created:**\n"
-                result_message += f"Your master todo list is now available in this DM!\n"
-                result_message += f"Canvas contains all tasks organized by priority and source.\n\n"
-            else:
-                result_message += f"⚠️ **Canvas Status:** {canvas_message}\n\n"
-            
-            result_message += f"🔄 **Next Steps:**\n"
-            result_message += f"• Use `/todo list` to see all your personal todos\n"
-            result_message += f"• Use `/todo complete [id]` to mark tasks done\n"
-            result_message += f"• Run `/task` again anytime to refresh from latest messages\n"
-            result_message += f"• Your personal Canvas automatically updates when you manage todos"
-            
             self.client.chat_postMessage(
                 channel=dm_channel_id,
                 text=result_message
             )
+            
+            # Create and send visual checklist template since Canvas is not supported in DMs
+            # if deduplicated_tasks:
+            #     checklist_template = self._generate_personal_canvas_content(user_id, deduplicated_tasks)
+            #     self.client.chat_postMessage(
+            #         channel=dm_channel_id,
+            #         text=checklist_template
+            #     )
+            
+            if deduplicated_tasks:
+                blocks = self._build_blockkit_checklist(deduplicated_tasks[:50])  # Slack limit
+                self.client.chat_postMessage(
+                    channel=dm_channel_id,
+                    blocks=blocks,
+                    text="Your personal master todo list"
+                )
+            else:
+                # fallback to text template if no tasks
+                checklist_template = self._generate_personal_canvas_content(user_id, deduplicated_tasks)
+                self.client.chat_postMessage(
+                    channel=dm_channel_id,
+                    text=checklist_template
+                )
+
+            # Send next steps
+            # next_steps_message = f"🔄 **Next Steps:**\n"
+            # next_steps_message += f"• Use `/todo list` to see all your personal todos\n"
+            # next_steps_message += f"• Use `/todo complete [id]` to mark tasks done\n"
+            # next_steps_message += f"• Run `/task` again anytime to refresh from latest messages\n"
+            # next_steps_message += f"• Your personal todo list automatically updates when you manage todos"
+            
+            # self.client.chat_postMessage(
+            #     channel=dm_channel_id,
+            #     text=next_steps_message
+            # )
             
             bot_command.status = 'completed'
             bot_command.save()
@@ -3197,16 +3272,138 @@ Canvas creates a beautiful visual todo list that you can share with your team. I
             logger.error(f"Error creating personal canvas: {str(e)}")
             return False, f"Error creating personal canvas: {str(e)}"
 
+    # def _generate_personal_canvas_content(self, user_id: str, tasks: List[Dict]) -> str:
+    #     """
+    #     Generate Canvas content for personal master todo list
+        
+    #     Args:
+    #         user_id: User ID
+    #         tasks: List of task dictionaries
+            
+    #     Returns:
+    #         Canvas markdown content
+    #     """
+    #     try:
+    #         from django.utils import timezone
+            
+    #         # Organize tasks by priority
+    #         priority_groups = {
+    #             'critical': [],
+    #             'high': [],
+    #             'medium': [],
+    #             'low': []
+    #         }
+            
+    #         for task in tasks:
+    #             priority = task.get('priority', 'medium')
+    #             priority_groups[priority].append(task)
+            
+    #         # Generate content
+    #         content_parts = [
+    #             f"# 🎯 Personal Master Todo List",
+    #             "",
+    #             f"> *Generated from your entire workspace • {timezone.now().strftime('%Y-%m-%d %H:%M')}*",
+    #             "",
+    #             f"📊 **Summary:** {len(tasks)} actionable tasks found across all your conversations",
+    #             "",
+    #             "## 📌 Your Tasks by Priority",
+    #             ""
+    #         ]
+            
+    #         # Add tasks by priority
+    #         for priority in ['critical', 'high', 'medium', 'low']:
+    #             if priority_groups[priority]:
+    #                 priority_emoji = {
+    #                     'critical': '🔴',
+    #                     'high': '🟠', 
+    #                     'medium': '🟡',
+    #                     'low': '🟢'
+    #                 }
+                    
+    #                 content_parts.append(f"### {priority_emoji[priority]} {priority.upper()} PRIORITY")
+    #                 content_parts.append("")
+                    
+    #                 for task in priority_groups[priority]:
+    #                     # Format task with source info
+    #                     checkbox = "- [ ]"
+    #                     title = task.get('title', 'Untitled task')
+    #                     source = task.get('source_name', 'Unknown source')
+    #                     task_type = task.get('task_type', 'general')
+                        
+    #                     # Task type emoji
+    #                     type_emoji = {
+    #                         'bug': '🐛', 'feature': '✨', 'meeting': '📅',
+    #                         'review': '👀', 'urgent': '🚨', 'deadline': '⏰'
+    #                     }
+                        
+    #                     todo_line = f"{checkbox} **{title}**"
+    #                     todo_line += f" | 📍 {source}"
+                        
+    #                     if task_type != 'general':
+    #                         todo_line += f" | {type_emoji.get(task_type, '📝')} {task_type}"
+                        
+    #                     # Add confidence score for transparency
+    #                     confidence = task.get('confidence_score', 0)
+    #                     todo_line += f" | 🎯 {confidence:.0%} confidence"
+                        
+    #                     content_parts.append(todo_line)
+                        
+    #                     # Add description if present
+    #                     description = task.get('description', '')
+    #                     if description:
+    #                         short_desc = description[:100] + "..." if len(description) > 100 else description
+    #                         content_parts.append(f"  💬 *{short_desc}*")
+                    
+    #                 content_parts.append("")
+            
+    #         # Add source breakdown
+    #         source_counts = {}
+    #         for task in tasks:
+    #             source_type = task.get('source_type', 'unknown')
+    #             source_name = task.get('source_name', 'Unknown')
+    #             key = f"{source_type}:{source_name}"
+    #             source_counts[key] = source_counts.get(key, 0) + 1
+            
+    #         content_parts.extend([
+    #             "## 📊 Task Sources",
+    #             "",
+    #         ])
+            
+    #         for source, count in sorted(source_counts.items(), key=lambda x: x[1], reverse=True):
+    #             source_type, source_name = source.split(':', 1)
+    #             type_emoji = "📢" if source_type == "channel" else "💬"
+    #             content_parts.append(f"- {type_emoji} **{source_name}**: {count} tasks")
+            
+    #         content_parts.extend([
+    #             "",
+    #             "---",
+    #             "### 💡 Quick Commands",
+    #             "- `/task` - Refresh this list with latest messages",
+    #             "- `/todo add \"task name\"` - Add manual todo",
+    #             "- `/todo complete [id]` - Mark todo as completed",  
+    #             "- `/todo list` - View all your todos",
+    #             "",
+    #             "*Your personal productivity assistant*"
+    #         ])
+            
+    #         return "\n".join(content_parts)
+            
+    #     except Exception as e:
+    #         logger.error(f"Error generating personal canvas content: {str(e)}")
+    #         return f"# Personal Master Todo List\n\nError generating content: {str(e)}"
+
+    
+    
     def _generate_personal_canvas_content(self, user_id: str, tasks: List[Dict]) -> str:
         """
-        Generate Canvas content for personal master todo list
+        Generate a beautiful Canvas-like checklist template for personal master todo list
         
         Args:
             user_id: User ID
             tasks: List of task dictionaries
             
         Returns:
-            Canvas markdown content
+            Formatted Slack message content (not markdown)
         """
         try:
             from django.utils import timezone
@@ -3223,63 +3420,70 @@ Canvas creates a beautiful visual todo list that you can share with your team. I
                 priority = task.get('priority', 'medium')
                 priority_groups[priority].append(task)
             
-            # Generate content
+            # Generate beautiful Slack-formatted content
             content_parts = [
-                f"# 🎯 Personal Master Todo List",
+                "🎯 *PERSONAL MASTER TODO LIST*",
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                f"📊 *Generated from your entire workspace • {timezone.now().strftime('%Y-%m-%d %H:%M')}*",
+                f"✨ *{len(tasks)} actionable tasks found across all conversations*",
                 "",
-                f"> *Generated from your entire workspace • {timezone.now().strftime('%Y-%m-%d %H:%M')}*",
-                "",
-                f"📊 **Summary:** {len(tasks)} actionable tasks found across all your conversations",
-                "",
-                "## 📌 Your Tasks by Priority",
+                "📌 *YOUR TASKS BY PRIORITY*",
                 ""
             ]
             
-            # Add tasks by priority
+            # Add tasks by priority with better formatting
             for priority in ['critical', 'high', 'medium', 'low']:
                 if priority_groups[priority]:
-                    priority_emoji = {
-                        'critical': '🔴',
-                        'high': '🟠', 
-                        'medium': '🟡',
-                        'low': '🟢'
+                    priority_config = {
+                        'critical': {'emoji': '🔴', 'name': 'CRITICAL PRIORITY'},
+                        'high': {'emoji': '🟠', 'name': 'HIGH PRIORITY'},
+                        'medium': {'emoji': '🟡', 'name': 'MEDIUM PRIORITY'},
+                        'low': {'emoji': '🟢', 'name': 'LOW PRIORITY'}
                     }
                     
-                    content_parts.append(f"### {priority_emoji[priority]} {priority.upper()} PRIORITY")
-                    content_parts.append("")
+                    config = priority_config[priority]
+                    content_parts.append(f"{config['emoji']} *{config['name']}*")
+                    content_parts.append("─────────────────────────────────────")
                     
-                    for task in priority_groups[priority]:
-                        # Format task with source info
-                        checkbox = "- [ ]"
+                    for i, task in enumerate(priority_groups[priority], 1):
+                        # Create checkbox-like format
                         title = task.get('title', 'Untitled task')
                         source = task.get('source_name', 'Unknown source')
                         task_type = task.get('task_type', 'general')
+                        confidence = task.get('confidence_score', 0)
                         
                         # Task type emoji
                         type_emoji = {
                             'bug': '🐛', 'feature': '✨', 'meeting': '📅',
-                            'review': '👀', 'urgent': '🚨', 'deadline': '⏰'
+                            'review': '👀', 'urgent': '🚨', 'deadline': '⏰',
+                            'general': '📝'
                         }
                         
-                        todo_line = f"{checkbox} **{title}**"
-                        todo_line += f" | 📍 {source}"
+                        # Create visual checkbox
+                        checkbox = "☐"  # Empty checkbox
                         
+                        # Main task line
+                        todo_line = f"{checkbox} *{title}*"
+                        
+                        # Add metadata on same line
+                        metadata = []
+                        metadata.append(f"📍{source}")
                         if task_type != 'general':
-                            todo_line += f" | {type_emoji.get(task_type, '📝')} {task_type}"
+                            metadata.append(f"{type_emoji.get(task_type, '📝')}{task_type}")
+                        metadata.append(f"🎯{confidence:.0%}")
                         
-                        # Add confidence score for transparency
-                        confidence = task.get('confidence_score', 0)
-                        todo_line += f" | 🎯 {confidence:.0%} confidence"
-                        
+                        todo_line += f" | {' | '.join(metadata)}"
                         content_parts.append(todo_line)
                         
-                        # Add description if present
+                        # Add description on next line with indent
                         description = task.get('description', '')
                         if description:
-                            short_desc = description[:100] + "..." if len(description) > 100 else description
-                            content_parts.append(f"  💬 *{short_desc}*")
+                            short_desc = description[:80] + "..." if len(description) > 80 else description
+                            content_parts.append(f"    💬 _{short_desc}_")
+                        
+                        content_parts.append("")  # Empty line between tasks
                     
-                    content_parts.append("")
+                    content_parts.append("")  # Extra space between priorities
             
             # Add source breakdown
             source_counts = {}
@@ -3290,33 +3494,34 @@ Canvas creates a beautiful visual todo list that you can share with your team. I
                 source_counts[key] = source_counts.get(key, 0) + 1
             
             content_parts.extend([
-                "## 📊 Task Sources",
-                "",
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                "📊 *TASK SOURCES*",
+                ""
             ])
             
             for source, count in sorted(source_counts.items(), key=lambda x: x[1], reverse=True):
                 source_type, source_name = source.split(':', 1)
                 type_emoji = "📢" if source_type == "channel" else "💬"
-                content_parts.append(f"- {type_emoji} **{source_name}**: {count} tasks")
+                content_parts.append(f"  {type_emoji} *{source_name}*: {count} tasks")
             
             content_parts.extend([
                 "",
-                "---",
-                "### 💡 Quick Commands",
-                "- `/task` - Refresh this list with latest messages",
-                "- `/todo add \"task name\"` - Add manual todo",
-                "- `/todo complete [id]` - Mark todo as completed",  
-                "- `/todo list` - View all your todos",
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+                "💡 *QUICK COMMANDS*",
+                "• `/task` - Refresh this list with latest messages",
+                "• `/todo add \"task name\"` - Add manual todo",
+                "• `/todo complete [id]` - Mark todo as completed",
+                "• `/todo list` - View all your todos",
                 "",
-                "*Your personal productivity assistant*"
+                "🤖 _Your personal productivity assistant_"
             ])
             
             return "\n".join(content_parts)
             
         except Exception as e:
             logger.error(f"Error generating personal canvas content: {str(e)}")
-            return f"# Personal Master Todo List\n\nError generating content: {str(e)}"
-
+            return f"🎯 *PERSONAL MASTER TODO LIST*\n\n❌ Error generating content: {str(e)}"
+    
     def _save_personal_todos(self, user_id: str, tasks: List[Dict]) -> int:
         """
         Save tasks to database as personal todos
